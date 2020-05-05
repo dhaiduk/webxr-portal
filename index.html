@@ -28,7 +28,15 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     <link rel='icon' type='image/png' sizes='32x32' href='favicon-32x32.png'>
     <link rel='icon' type='image/png' sizes='96x96' href='favicon-96x96.png'>
     <link rel='stylesheet' href='css/common.css'>
-
+    <style type="text/css">
+      body {
+          margin: 0;
+          background-color: #000;
+      }
+      canvas {
+          display: block;
+      }
+  </style>
     <title>Hit Test</title>
   </head>
   <body>
@@ -38,6 +46,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         <p>
           This sample demonstrates use of hit testing to place virtual objects on real-world surfaces.
           <a class="back" href="./">Back</a>
+          <br/>
+          <hr/>
+          Autoplay when VR starts: <input id='autoplayVideo' type='checkbox'/>
         </p>
       </details>
     </header>
@@ -45,12 +56,27 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       import {WebXRButton} from './js/util/webxr-button.js';
       import {Scene} from './js/render/scenes/scene.js';
       import {Renderer, createWebGLContext} from './js/render/core/renderer.js';
+      import {UrlTexture} from './js/render/core/texture.js';
+      import {ButtonNode} from './js/render/nodes/button.js'
       import {Node} from './js/render/core/node.js';
       import {Gltf2Node} from './js/render/nodes/gltf2.js';
+      import {VideoNode} from './js/render/nodes/video.js';
       import {DropShadowNode} from './js/render/nodes/drop-shadow.js';
       import {vec3} from './js/render/math/gl-matrix.js';
       import {Ray} from './js/render/math/ray.js';
+      import {InlineViewerHelper} from './js/util/inline-viewer-helper.js';
+      import {QueryArgs} from './js/util/query-args.js';
 
+
+      // If requested, use the polyfill to provide support for mobile devices
+      // and devices which only support WebVR.
+      import WebXRPolyfill from './js/third-party/webxr-polyfill/build/webxr-polyfill.module.js';
+      if (QueryArgs.getBool('usePolyfill', true)) {
+        let polyfill = new WebXRPolyfill();
+      }
+
+      //let autoplayCheckbox = document.getElementById('autoplayVideo');
+      let autoplayCheckbox = true;
       // XR globals.
       let xrButton = null;
       let xrRefSpace = null;
@@ -61,13 +87,71 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       let gl = null;
       let renderer = null;
       let scene = new Scene();
-      scene.enableStats(false);
+      scene.addNode(new Gltf2Node({url: 'media/gltf/home-theater/home-theater.gltf'}));
+           scene.enableStats(false);
+
+
+      let video = document.createElement('video');
+      video.loop = true;
+      video.src = 'media/video/1024.mp4';
+
+      let videoNode = new VideoNode({
+        video: video,
+        displayMode: 'stereoTopBottom'
+      });
+
+      // When the video is clicked we'll pause it if it's playing.
+      videoNode.onSelect(() => {
+        if (!video.paused) {
+          playButton.visible = true;
+          video.pause();
+        } else {
+          playButton.visible = false;
+          video.play();
+        }
+      });
+      videoNode.selectable = true;
+
+      // Move back to the position of the in-room screen and size to cover it.
+      // Values determined experimentally and with many refreshes.
+      videoNode.translation = [0.025, 0.275, -4.4];
+      videoNode.scale = [2.1, 1.1, 1.0];
+      
+      scene.addNode(videoNode);
+
+      video.addEventListener('loadeddata', () => {
+        // Once the video has loaded up adjust the aspect ratio of the "screen"
+        // to fit the video's native shape.
+        let aspect = videoNode.aspectRatio;
+        if (aspect < 2.0) {
+          videoNode.scale = [aspect * 1.1, 1.1, 1.0];
+        } else {
+          videoNode.scale = [2.1, 2.1 / aspect, 1.0];
+        }
+      });
+
+      // Add a button to the scene to play/pause the movie.
+      let playTexture = new UrlTexture('media/textures/play-button.png');
+
+      // Create a button that plays the video when clicked.
+      let playButton = new ButtonNode(playTexture, () => {
+        // Play the video and hide the button.
+        if (video.paused) {
+          playButton.visible = false;
+          video.play();
+        }
+      });
+      // Move the play button to the center of the screen and make it much
+      // bigger.
+      playButton.translation = [0.025, 0.275, -4.2];
+      playButton.scale = [5.0, 5.0, 5.0];
+      scene.addNode(playButton);
 
       let arObject = new Node();
       arObject.visible = false;
       scene.addNode(arObject);
 
-      let flower = new Gltf2Node({url: 'media/gltf/sunflower/sunflower.gltf'});
+      let flower = new Gltf2Node({url: 'media/gltf/demoroom/DemoRoom.glb'});
       arObject.addNode(flower);
 
       let reticle = new Gltf2Node({url: 'media/gltf/reticle/reticle.gltf'});
@@ -80,7 +164,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       vec3.set(shadow.scale, 0.15, 0.15, 0.15);
       arObject.addNode(shadow);
 
-      const MAX_FLOWERS = 30;
+      const MAX_FLOWERS = 1;
       let flowers = [];
 
       // Ensure the background is transparent for AR.
@@ -101,14 +185,41 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                       .then((supported) => {
             xrButton.enabled = supported;
           });
+        //  navigator.xr.requestSession('inline').then(onSessionStarted);
         }
       }
 
       function onRequestSession() {
-        return navigator.xr.requestSession('immersive-ar', {requiredFeatures: ['local', 'hit-test']})
-                           .then((session) => {
+        
+        let autoplay = true;
+
+        let pending;
+
+        if (autoplay) {
+        // If we want the video to autoplay when the session has fully started
+        // (which may be several seconds after the original requestSession
+        // call due to clicking through consent prompts or similar) then we
+        // need to start the video within a user activiation event first
+        // (which this function is.) Once it's been started successfully we
+        // pause it, at which point we can resume it pretty much whenever we'd
+        // like.
+        pending = video.play().then(() => {
+          video.pause();
+        });
+}
+
+        return navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local', 'hit-test']
+        }).then((session) => {
           xrButton.setSession(session);
+          //session.isImmersive = true;
           onSessionStarted(session);
+
+          if (autoplay) {
+            pending.then(() => {
+              video.play();
+            });
+          }
         });
       }
 
@@ -120,6 +231,15 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           gl = createWebGLContext({
             xrCompatible: true
           });
+          document.body.appendChild(gl.canvas);
+
+          function onResize() {
+            gl.canvas.width = gl.canvas.clientWidth * window.devicePixelRatio;
+            gl.canvas.height = gl.canvas.clientHeight * window.devicePixelRatio;
+          }
+          window.addEventListener('resize', onResize);
+          onResize();
+
 
           renderer = new Renderer(gl);
 
@@ -183,6 +303,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           // so we can just use it's matrix to save an unnecessary call to 
           // event.frame.getHitTestResults.
           addARObjectAt(reticle.matrix);
+          let refSpace = event.frame.session.isImmersive ?
+                           xrImmersiveRefSpace :
+                           inlineViewerHelper.referenceSpace;
+          scene.handleSelect(event.inputSource, event.frame, refSpace);
+
         }
       }
 
@@ -215,6 +340,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
       // Start the XR application.
       initXR();
+      
     </script>
+
   </body>
 </html>
